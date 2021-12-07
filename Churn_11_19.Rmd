@@ -1,0 +1,648 @@
+---
+title: "churn_11_18"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+```
+
+```{r}
+library(doParallel) #multicore processing
+library(glmnet) #lasso
+library(ggplot2) #ploting
+library(forecast) 
+library(caret) #ml package
+library(dplyr) 
+library(OptimalCutpoints)  #best cut point
+library(xgboost) #xgboost
+library(splitstackshape) #data partition
+library(naniar)#find missing value
+library(DMwR)#SMOTE
+library(xgboostExplainer) # Load XGboost Explainer
+library(pROC) # Load proc
+library(randomForest)
+library(fastDummies)
+```
+
+```{r}
+load("churn_data.rda") #the data is clean
+colnames(churn_data) #
+churn_data$Churn.Value <- as.factor(churn_data$Churn.Value)
+churn_data$Zip.Code <- as.factor(churn_data$Zip.Code) #zip code is should be a factor, but we are going to use them anyway....
+total_data <- cbind.data.frame(churn_value = churn_data$Churn.Value,churn_data[,-c(1,2,10,11,13,14,17,18,19,20,21,22,24,25,26)]) # move the churn.value to the first row
+indx <- which(unlist(summarise_each(total_data, funs(class)) =='character')) #select the character columns
+for (i in indx){
+  total_data[,i] <- gsub(" ", "_",total_data[,i])
+  total_data[,i] <- gsub("-", "_",total_data[,i])#need to replace the space to underscore, it will smooth the later scaling process
+}
+```
+
+
+
+
+
+```{r}
+rf <- randomForest(churn_value~., total_data[,-c(10,11)])
+varImpPlot(rf, type =2, n.var = 10)
+```
+```{r}
+library(ggmap)
+
+register_google("AIzaSyAVJQUd1mGICFac5zKE_r055727U5MJO9s")
+CAmap <- get_map(location ='california',zoom = 6, maptype = "roadmap", color = "bw")
+ggmap(CAmap, base_layer = ggplot(aes(x = Longitude, y= Latitude), data = total_data)) + geom_point(data = total_data, aes(color = churn_value, alpha = 0.3)) 
+
+total_data$Longitude
+```
+
+```{r}
+ggplot(data = total_data, aes(x = Contract, fill = churn_value))+
+  geom_bar()+ 
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+
+
+```{r}
+ggplot(data = total_data, aes(x = Monthly.Charge, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+```{r}
+ggplot(data = total_data, aes(x = Tenure.in.Months, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+```{r}
+ggplot(data = total_data, aes(x = Number.of.Referrals, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+ggplot(data = total_data, aes(x = City, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+plot_city_dat <- data.frame(total_user = summary(factor(total_data$City)))
+ggplot(data = total_data[total_data$City == rownames(plot_city_dat)[1:7],], aes(x = City, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+ggplot(data = total_data, aes(x = Age, fill = churn_value))+
+  geom_bar()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+```{r}
+ggplot(data = total_data[total_data$City == rownames(plot_city_dat)[1:7],], aes(x = City, fill = Senior.Citizen))+
+  geom_bar()+
+  theme_bw()+
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+```
+
+
+
+
+```{r}
+total_data <- total_data %>% select(-Longitude,-Latitude)
+scaledata <- dummy_cols(total_data[,-1],remove_selected_columns = T)
+scaledata <- scale(scaledata)
+scaledata <- cbind.data.frame(churn_value= total_data$churn_value,scaledata)
+```
+
+```{r}
+set.seed(1)
+doParallel::registerDoParallel(cores = 6)
+x_vars <- as.matrix(scaledata[,-1])
+lambda_seq <- 10^seq(4, -4, by = -.1)
+cv.lasso <- cv.glmnet(x = x_vars, 
+                      y = total_data$churn_value, 
+                      alpha = 1, 
+                      family = "binomial", 
+                      lambda = lambda_seq, 
+                      parallel = T,
+                      nfolds = 10)
+best_lam <- cv.lasso$lambda.1se 
+best_lam 
+
+lambda_seq <- seq(best_lam-0.004,best_lam+0.005,0.0001)# reduce the testing range
+
+cv.lasso <- cv.glmnet(x = x_vars, 
+                      y = total_data$churn_value, 
+                      alpha = 1, 
+                      family = "binomial", 
+                      lambda = lambda_seq,
+                      parallel = T,
+                      nfolds = 10)
+best_lam <- cv.lasso$lambda.1se
+best_lam 
+
+best_lasso <- glmnet(x = x_vars,
+                     y = total_data$churn_value,
+                     alpha = 1,
+                     family = "binomial",
+                     lambda = best_lam)
+
+
+lasso_coef <- as.data.frame(as.matrix(coef(best_lasso))) %>% filter(s0 != 0)
+lasso_coef_list <- c("churn_value",row.names(lasso_coef)[-1])
+
+```
+
+#fitting the lasso Regression model
+```{r}
+
+set.seed(1)
+temp_lasso <- stratified(scaledata, group = "churn_value", size = 0.8,bothSets = T)
+lasso_train <- temp_lasso[[1]]
+lasso_test <- data.matrix(temp_lasso[[2]])
+lasso_test[,1] <-lasso_test[,1]-1
+
+
+x_vars <- lasso_train[,-1]
+best_lasso1 <- glmnet(x = x_vars,
+                     y = as.factor(lasso_train$churn_value),
+                     alpha = 1,
+                     family = "binomial",
+                     type.measure="class",
+                     lambda = best_lam)
+ 
+```
+
+
+#prediction and find best cutoff point
+```{r}
+
+lasso_pred <- predict(best_lasso1, lasso_test[,-1], type = "response")
+df_pred <- cbind.data.frame(response = lasso_test[,1],prediction = lasso_pred[,1])
+oc<- optimal.cutpoints(X = "prediction",
+                       status = "response",
+                       tag.healthy = 0,
+                       data = df_pred,
+                       methods = "MaxEfficiency")
+
+best_cut_off <- oc$MaxEfficiency$Global$optimal.cutoff$cutoff
+best_cut_off
+```
+
+
+
+```{r}
+lasso_result <- ifelse(lasso_pred > best_cut_off, 1, 0)
+plot(lasso_pred,lasso_test[,1])
+t <- table(response = lasso_test[,1],prediction = lasso_result[,1])
+confusionMatrix(t, positive = "1")
+```
+
+#prepare Xgboost data
+```{r}
+xgb_total <- dummy_columns(total_data[,-1],remove_selected_columns = T)
+xgb_total <- cbind.data.frame(churn_value= total_data$churn_value,xgb_total)
+xgb_total <- xgb_total[,lasso_coef_list]
+
+
+set.seed(1)
+temp <- stratified(as.data.frame(xgb_total), group = "churn_value", size = .8, bothSets = T)
+xgb_prep <- data.matrix(temp[[1]])
+xgb_prep[,1] <- xgb_prep[,1]-1
+xgb_prep1 <- data.matrix(temp[[2]])
+xgb_prep1[,1] <- xgb_prep1[,1]-1
+
+xgb_train <- xgb.DMatrix(data = xgb_prep[,-1], label = xgb_prep[,1] )
+xgb_test <- xgb.DMatrix(data = xgb_prep1[,-1], label = xgb_prep1[,1] )
+
+xgb_prep <- data.frame(temp[[1]])
+xgb_prep1 <- data.frame(temp[[2]])
+```
+
+
+```{r}
+set.seed(1)
+bst <- xgboost(data = xgb_train, # Set training data
+               eta = 0.1, # Set learning rate
+               nrounds = 2000, # Set number of rounds
+               early_stopping_rounds = 50, # Set number of rounds to stop at 
+               verbose = 1, # 1 - Prints out fit
+               nthread = 1, # Set number of parallel threads
+               print_every_n = 20, # Prints out result every 20th iteration
+              
+               objective = "binary:logistic", # Set objective
+               eval_metric = "auc",
+               eval_metric = "error") 
+xgb_pred <- predict(bst, xgb_test)
+pred_dat <- cbind.data.frame(prediction = xgb_pred , response = xgb_prep1$churn_value)
+
+
+oc<- optimal.cutpoints(X = "prediction",
+                       status = "response",
+                       tag.healthy = 0,
+                       data = pred_dat,
+                       methods = "MaxEfficiency")
+
+best_cut_off <- oc$MaxEfficiency$Global$optimal.cutoff$cutoff
+result <- ifelse(xgb_pred > best_cut_off, 1, 0)
+plot(xgb_pred,xgb_prep1$churn_value)
+t <- table(response = xgb_prep1$churn_value,prediction = result)
+confusionMatrix(t, positive = "1")
+```
+
+
+
+```{r}
+xgb_roc <-  roc(xgb_prep1$churn_value,xgb_pred)
+lasso_roc <-  roc(lasso_test[,1],lasso_pred)
+
+plot.roc(xgb_roc, print.auc = TRUE, col = "red", print.auc.col = "red")
+plot.roc(lasso_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="blue", print.auc.col = "blue", add = TRUE)
+```
+
+#tuning preparation   
+```{r}
+max_depth_vals <- c(3, 5, 7, 10, 15)
+min_child_weight <- c(1,3,5,7, 10, 15)
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+```
+
+
+
+```{r}
+for (i in 1:nrow(cv_params)){
+  set.seed(1)
+  bst.tune <- xgb.cv(data = xgb_train,
+                     eta = 0.1, # Set learning rate
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 100, # Set number of rounds to stop at 
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 6, # Set number of parallel threads
+                     print_every_n = 100, # Prints out result every 20th iteration
+                     max_depth_vals = cv_params$max_depth[i],
+                     min_child_weight = cv_params$min_child_weight[i],
+                     nfold = 5,
+                     objective = "binary:logistic", # Set objective
+                     eval_metric = "auc",
+                     eval_metric = "error")
+  auc_vec[i] <- bst.tune$evaluation_log$test_auc_mean[bst.tune$best_ntreelimit]
+  error_vec[i] <- bst.tune$evaluation_log$test_error_mean[bst.tune$best_ntreelimit]
+}
+```
+```{r}
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error")
+res_db$max_depth <- as.factor(res_db$max_depth)
+res_db$min_child_weight <- as.factor(res_db$min_child_weight)
+
+
+ggplot(res_db, aes(x = min_child_weight, y = max_depth, fill = auc))+ geom_tile()
+
+ggplot(res_db, aes(x = min_child_weight, y = max_depth, fill = error))+ geom_tile()
+res_db
+```
+optimal point: max_depth = 5, min_child_weight = 7
+optimal point(without satisfactory score): max_depth = any, min_chuild_weight = 1
+
+```{r}
+gamma_vals <- c(0, 0.05, 0.1, 0.15, .2)
+auc_vec <- error_vec <- rep(NA, length(gamma_vals)) 
+set.seed(1)
+for (i in 1:length(auc_vec)){
+  bst.tune <- xgb.cv(data = xgb_train,
+                     eta = 0.1, # Set learning rate
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 100, # Set number of rounds to stop at 
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 6, # Set number of parallel threads
+                     print_every_n = 100, # Prints out result every 20th iteration
+                     max_depth_vals = 5,
+                     min_child_weight = 1,
+                     gamma = gamma_vals[i],
+                     
+                     nfold = 5,
+                     objective = "binary:logistic", # Set objective
+                     eval_metric = "auc",
+                     eval_metric = "error")
+auc_vec[i] <- bst.tune$evaluation_log$test_auc_mean[bst.tune$best_ntreelimit]
+error_vec[i] <-  bst.tune$evaluation_log$test_error_mean[bst.tune$best_ntreelimit]
+}
+```
+```{r}
+res_db <- cbind.data.frame(gamma_vals, auc_vec, error_vec)
+res_db
+```
+#best gamma = 0.1
+#best gamma(without satisfactory score) =0
+
+```{r}
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of subsample values
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of col sample values
+cv_params <- expand.grid(subsample,colsample_by_tree)
+names(cv_params) <- c('subsample', "colsample_by_tree")
+
+auc_vec <- error_vec <- rep(NA, nrow(cv_params)) 
+set.seed(1)
+for (i in 1:length(auc_vec)){
+  bst.tune <- xgb.cv(data = xgb_train,
+                     eta = 0.1, # Set learning rate
+                     nrounds = 1000, # Set number of rounds
+                     early_stopping_rounds = 100, # Set number of rounds to stop at 
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 6, # Set number of parallel threads
+                     print_every_n = 100, # Prints out result every 20th iteration
+                     max_depth_vals = 5,
+                     min_child_weight = 1,
+                     gamma = 0,
+                     subsample = cv_params$subsample[1],
+                     colsample_bytree = cv_params$colsample_by_tree[1],
+                     
+                     nfold = 5,
+                     objective = "binary:logistic", # Set objective
+                     eval_metric = "auc",
+                     eval_metric = "error")
+auc_vec[i] <- bst.tune$evaluation_log$test_auc_mean[bst.tune$best_ntreelimit]
+error_vec[i] <-  bst.tune$evaluation_log$test_error_mean[bst.tune$best_ntreelimit]
+}
+```
+
+```{r}
+res_db <- cbind.data.frame(cv_params, auc_vec, error_vec)
+names(res_db)[3:4] <- c("auc", "error") 
+res_db$subsample <- as.factor(res_db$subsample)
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree)
+
+
+ggplot(res_db, aes(x = subsample, y = colsample_by_tree, fill = auc))+ geom_tile()
+
+ggplot(res_db, aes(x = subsample, y = colsample_by_tree, fill = error))+ geom_tile()
+res_db
+```
+subsample : 0.8 , 0.6(w/o)
+colsample_by_tree : 0.6,  0.9(w/o)
+
+```{r}
+eta_tuning <- function(eta_val){
+set.seed(1)
+bst_eta <- xgb.cv(data = xgb_train, # Set training data
+                     nfold = 5, # Use 5 fold cross-validation
+                     eta = eta_val, # Set learning rate
+                     max.depth = 5,
+                     min_child_weight = 1,
+                     gamma = 0,
+                     subsample = 0.6, # Set proportion of training data to use in tree
+                     colsample_bytree = 0.9, # Set number of variables to use in each tree
+                     
+                     
+                     nrounds = 20000, # Set number of rounds
+                     early_stopping_rounds = 1000, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 6, # Set number of parallel threads
+                     print_every_n = 100, # Prints out result every 20th iteration
+                     
+                     objective = "binary:logistic", # Set objective
+                     eval_metric = "auc",
+                     eval_metric = "error") # Set evaluation metric to use
+
+}
+
+eta_0.005 <- eta_tuning(0.005)
+eta_0.01 <- eta_tuning(0.01)
+eta_0.05 <- eta_tuning(0.05)
+eta_0.1 <- eta_tuning(0.1)
+eta_0.3 <- eta_tuning(0.3)
+
+pd1 <- cbind.data.frame(eta_0.005$evaluation_log[,c("iter", "test_error_mean")], rep(0.005, nrow(eta_0.005$evaluation_log)))
+names(pd1)[c(1,2,3)] <- c("iter","error","eta")
+pd2 <- cbind.data.frame(eta_0.01$evaluation_log[,c("iter", "test_error_mean")], rep(0.01, nrow(eta_0.01$evaluation_log)))
+names(pd2)[c(1,2,3)] <- c("iter","error","eta")
+pd3 <- cbind.data.frame(eta_0.05$evaluation_log[,c("iter", "test_error_mean")], rep(0.05, nrow(eta_0.05$evaluation_log)))
+names(pd3)[c(1,2,3)] <- c("iter","error","eta")
+pd4 <- cbind.data.frame(eta_0.1$evaluation_log[,c("iter", "test_error_mean")], rep(0.1, nrow(eta_0.1$evaluation_log)))
+names(pd4)[c(1,2,3)] <- c("iter","error","eta")
+pd5 <- cbind.data.frame(eta_0.3$evaluation_log[,c("iter", "test_error_mean")], rep(0.3, nrow(eta_0.3$evaluation_log)))
+names(pd5)[c(1,2,3)] <- c("iter","error","eta")
+```
+
+
+```{r}
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+plot_data$eta <- as.factor(plot_data$eta)
+ggplot(plot_data, aes(x = iter, y = error, color = eta))+
+  geom_smooth(alpha = 0.5) +
+  theme_bw()
+```
+
+```{r}
+set.seed(1)
+bst <- xgboost(data = xgb_train, # Set training data
+                     eta = 0.01, # Set learning rate
+                     max.depth = 5,
+                     min_child_weight = 1,
+                     gamma = 0,
+                     subsample = 0.6, # Set proportion of training data to use in tree
+                     colsample_bytree = 0.9, # Set number of variables to use in each tree
+                     
+                     nrounds = 600, # Set number of rounds
+                     early_stopping_rounds = 100, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 6, # Set number of parallel threads
+                     print_every_n = 200, # Prints out result every 20th iteration
+                     
+                     objective = "binary:logistic", # Set objective
+                     eval_metric = "auc",
+                     eval_metric = "error") # Set evaluation metric to use
+xgb_pred <- predict(bst, xgb_test)
+pred_dat <- cbind.data.frame(prediction = xgb_pred , response = xgb_prep1$churn_value)
+
+
+oc<- optimal.cutpoints(X = "prediction",
+                       status = "response",
+                       tag.healthy = 0,
+                       data = pred_dat,
+                       methods = "MaxEfficiency")
+
+best_cut_off <- oc$MaxEfficiency$Global$optimal.cutoff$cutoff
+bst_xgb_result <- ifelse(xgb_pred > best_cut_off, 1, 0)
+plot(xgb_pred,xgb_prep1$churn_value)
+t <- table(response = xgb_prep1$churn_value,prediction = bst_xgb_result)
+confusionMatrix(t, positive = "1")
+
+```
+```{r}
+imp_mat <- xgb.importance(model = bst)
+xgb.plot.importance(imp_mat, top_n = 10)
+
+```
+
+
+
+```{r}
+xgb_roc <-  roc(xgb_prep1$churn_value,xgb_pred)
+lasso_roc <-  roc(lasso_test[,1],lasso_pred)
+
+plot.roc(xgb_roc, print.auc = TRUE, col = "red", print.auc.col = "red")
+plot.roc(lasso_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="blue", print.auc.col = "blue", add = TRUE)
+```
+
+
+
+
+```{r}
+set.seed(1)
+normalized_dat <- xgb_total[,lasso_coef_list][,-1]
+x_mean <- apply(normalized_dat, 2, mean)
+x_sd <- apply(normalized_dat, 2, sd)
+normalized_dat <- scale(normalized_dat, center = x_mean, scale = x_sd)
+normalized_dat <- cbind.data.frame(churn_value = xgb_total$churn_value, normalized_dat)
+
+temp_total <- stratified(normalized_dat, group = "churn_value", size = 0.8,bothSets = T)
+train_data <- temp_total[[1]]
+test_data <- temp_total[[2]]
+```
+
+
+```{r}
+lm_full <- glm(churn_value ~.,train_data, family = "binomial")
+formula(lm_full)
+library(gam)
+gam_1 <- gam(churn_value ~ s(Age) + s(Number.of.Referrals) + s(Tenure.in.Months) + 
+    s(Monthly.Charge) + Senior.Citizen_No + Senior.Citizen_Yes +
+    Married_No + Married_Yes + Dependents_No + Dependents_Yes + 
+    City_Bakersfield + City_Davis_Creek + City_Fallbrook + City_Grizzly_Flats + 
+    City_Jackson + City_Pearblossom + City_Piru + City_Riverbank + 
+    City_Running_Springs + City_San_Diego + City_San_Dimas + 
+    City_Seeley + City_Smith_River + City_Temecula + City_Twain + 
+    City_Upland + City_Winterhaven + Referred.a.Friend_No + Referred.a.Friend_Yes + 
+    Offer_Offer_D + Offer_Offer_E + Phone.Service_No + Phone.Service_Yes + 
+    Internet.Service_No + Internet.Service_Yes + Internet.Type_Fiber_Optic + 
+    Internet.Type_None + Online.Security_No + Online.Security_Yes + 
+    Premium.Tech.Support_No + Premium.Tech.Support_Yes + Streaming.TV_No + 
+    Streaming.TV_Yes + Streaming.Music_No + Contract_Month_to_Month + 
+    Contract_Two_Year + Paperless.Billing_No + Paperless.Billing_Yes + 
+    Payment.Method_Credit_Card + Payment.Method_Mailed_Check, train_data, family = "binomial")
+set.seed(1)
+nn1 <- neuralnet::neuralnet(churn_value == 1~.,train_data, linear.output = F, hidden = c(4))
+
+
+```
+
+
+```{r}
+
+lm_full_pred <- predict(lm_full, test_data, type = "response")
+gam_1_pred <- predict(gam_1, test_data, type = "response")
+nn1_pred <- predict(nn1, test_data)
+confusionMatrix(factor(ifelse(gam_1_pred>0.5, '1', '0')), test_data$churn_value, positive = '1')
+confusionMatrix(factor(ifelse(lm_full_pred>0.5, '1', '0')), test_data$churn_value, positive = '1')
+confusionMatrix(factor(ifelse(nn1_pred>0.5, '1', '0')), test_data$churn_value, positive = '1')
+```
+
+
+
+
+
+```{r}
+lm_roc <- roc(test_data$churn_value, lm_full_pred)
+gam_roc <- roc(test_data$churn_value, gam_1_pred)
+nn_roc <- roc(test_data$churn_value, nn1_pred)
+plot.roc(xgb_roc, print.auc = TRUE, col = "red", print.auc.col = "red")
+plot.roc(lasso_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="blue", print.auc.col = "blue", add = TRUE)
+plot.roc(lm_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="dark green", print.auc.col = "dark green",add = TRUE)
+plot.roc(gam_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="orange", print.auc.col = "orange", add = TRUE)
+plot.roc(nn_roc, print.auc = TRUE, print.auc.x = 0, print.auc.y = 0.6, col ="light blue", print.auc.col = "light blue", add = TRUE)
+
+
+lift_chart <- lift(xgb_prep1$churn_value~xgb_pred+lasso_pred+gam_1_pred+lm_full_pred+nn1_pred, class='1', cuts=200)
+xyplot(lift_chart, auto.key=list(columns=5), main='Lift Chart')
+```
+We are selecting bst_xgb as out final model
+```{r}
+set.seed(1)
+temp1 <- stratified(total_data, group = "churn_value", size = 0.8,bothSets = T)
+test_cltv <- temp1[[2]]$CLTV
+```
+
+
+```{r}
+model_result <- function(x,Retention_rate, marketing_cost) {
+  tuning <- seq(0, .7, 0.01) 
+  accuracy_table <- matrix(0,ncol = 6,
+                           nrow = length(tuning),
+                           dimnames = list(tuning, c("Accuracy","Precision","Recall(Churned)","Specificity(Stayed)","F1_score","Potential_Profit")))
+  
+  for (i in tuning) {
+    Accuracy <- length(x[(x < i & test_data$churn_value == 0)|(x > i & test_data$churn_value == 1)])/length(x)
+    Precision <- length(x[x > i & test_data$churn_value == 1])/length(x[x > i])
+    Recall <- length(x[x > i & test_data$churn_value == 1])/length(x[test_data$churn_value == 1])
+    Specificity <- length(x[x < i & test_data$churn_value == 0])/length(x[test_data$churn_value == 0])
+    F1_score <-  2 * (Recall*Precision) / (Recall + Precision)
+    Potential_Profit <- sum(test_cltv[x > i & test_data$churn_value == 1])*Retention_rate-length(x[x > i])*marketing_cost
+    accuracy_table[rownames(accuracy_table) == i,
+                   1] <- Accuracy
+    accuracy_table[rownames(accuracy_table) == i,
+                   2] <- Precision
+    accuracy_table[rownames(accuracy_table) == i,
+                   3] <- Recall
+    accuracy_table[rownames(accuracy_table) == i,
+                   4] <- Specificity
+    accuracy_table[rownames(accuracy_table) == i,
+                   5] <- F1_score
+    accuracy_table[rownames(accuracy_table) == i,
+                   6] <- Potential_Profit
+  }
+  print(accuracy_table)
+}
+business_model_result <- model_result(xgb_pred, 0.15, 100)
+```
+
+
+```{r}
+business_model_result <- cbind.data.frame(cut_point = row.names(business_model_result),business_model_result)
+
+ggplot(data = business_model_result, aes(x = cut_point, y = Potential_Profit))+
+  geom_point()+
+  theme_bw() +
+  theme(panel.background = element_blank(),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank())
+
+```
+
+
+
